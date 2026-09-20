@@ -1,6 +1,7 @@
 import { simpleHash } from "./utils.js";
 import { EJS_STORAGE } from "./storage.js";
 import { EJS_COMPRESSION } from "./compression.js";
+import { readZipEntries, streamingSupported } from "./zipstream.js";
 
 const CACHE_BLOB_CHUNK_SIZE = 50 * 1024 * 1024;
 
@@ -107,7 +108,7 @@ class EJS_Download {
      * @param {boolean} dontExtract - If true, the downloaded file will not be extracted, but will still be cached (default is false, overridden by forceExtract).
      * @returns {Promise<EJS_CacheItem>} - The downloaded file as an EJS_CacheItem.
      */
-    downloadFile(url, type, method = "GET", headers = {}, body = null, onProgress = null, onComplete = null, timeout = 30000, responseType = "arraybuffer", forceExtract = false, dontCache = false, dontExtract = false) {
+    downloadFile(url, type, method = "GET", headers = {}, body = null, onProgress = null, onComplete = null, timeout = 30000, responseType = "arraybuffer", forceExtract = false, dontCache = false, dontExtract = false, onFile = null) {
         let cacheActiveText = " (cache usage requested)"
         if (dontCache) {
             cacheActiveText = "";
@@ -218,6 +219,91 @@ class EJS_Download {
                         }
                         
                         const blob = new Blob(chunks);
+
+                        // Archives beyond this size cannot be flattened into a
+                        // single ArrayBuffer (V8 caps one at ~2 GiB), and the
+                        // wasm extractor could not hold them either. Read them
+                        // straight out of the Blob one entry at a time instead.
+                        // Everything smaller keeps the original path exactly.
+                        const streamThreshold = (typeof window !== "undefined" && typeof window.EJS_streamZipThreshold === "number")
+                            ? window.EJS_streamZipThreshold
+                            : 1610612736;
+                        const isZip = (filename.toLowerCase().split(".").pop() === "zip");
+                        // dontExtract is how a core asks for the archive itself
+                        // rather than its contents -- the arcade/MAME family
+                        // reads a romset zip directly -- and forceExtract
+                        // overrides that. Mirror the ordinary path's rule below
+                        // instead of letting the size gate outrank it.
+                        const extractionWanted = (forceExtract === true || dontExtract === false);
+                        if (blob.size > streamThreshold && isZip && extractionWanted && typeof onFile === "function" && streamingSupported()) {
+                            console.log(`[EJS Download] Streaming ${filename} (${(blob.size / 1048576).toFixed(0)} MB) directly to the filesystem`);
+                            const entryNames = [];
+                            let reportedTotal = false;
+                            let lastWritten = 0, lastTotal = 0;
+                            try {
+                                await readZipEntries(blob, (entryName, entryBytes) => {
+                                    // readZipEntries allocates a fresh array per
+                                    // entry and never reuses it, and a streamed
+                                    // item keeps files empty, so nothing else
+                                    // aliases these bytes: MEMFS can take them.
+                                    onFile(entryName, entryBytes, true);
+                                    entryNames.push(entryName);
+                                }, (written, total) => {
+                                    // Nothing gates this on memory: a browser will
+                                    // not report what is free, and navigator.deviceMemory
+                                    // gives total RAM rounded and capped, which says
+                                    // nothing about what is available. State the
+                                    // requirement instead, so the out-of-memory failure
+                                    // below is immediately interpretable.
+                                    if (!reportedTotal && total) {
+                                        reportedTotal = true;
+                                        console.log(`[EJS Download] ${filename} unpacks to ${(total / 1073741824).toFixed(2)} GB, all of which must be resident`);
+                                    }
+                                    lastWritten = written; lastTotal = total;
+                                    // The zip's central directory gives a real
+                                    // total, so this reports a true percentage
+                                    // rather than a byte count with no end.
+                                    if (onProgress) onProgress("decompressing", total ? written / total * 100 : 0, written, total);
+                                });
+                            } catch (e) {
+                                // download() flattens every failure to
+                                // "Network Error". That is actively misleading
+                                // here: the download already finished, and what
+                                // failed was the unpack. Out of memory is the
+                                // likely cause, and nothing upstream of here
+                                // could have predicted it: no browser reports
+                                // free memory.
+                                // How far it got is the one number worth having:
+                                // it separates "died immediately" from "nearly
+                                // made it", and it is the only way to compare
+                                // two builds' peak usage without guessing from
+                                // a system memory graph.
+                                const text = String((e && e.message) || e);
+                                const mb = (n) => (n / 1048576).toFixed(0);
+                                const progress = lastTotal
+                                    ? ` after ${mb(lastWritten)} MB of ${mb(lastTotal)} MB unpacked (${Math.floor(lastWritten / lastTotal * 100)}%)`
+                                    : "";
+                                const err = new Error(`Decompression failed${progress}: ${text}`);
+                                err.ejsUserMessage = /allocation failed|out of memory|RangeError/i.test(text)
+                                    ? `Ran out of memory while unpacking ${filename}. Close other tabs or apps and try again.`
+                                    : `Could not unpack ${filename}: ${text}`;
+                                reject(err);
+                                return;
+                            }
+                            const streamedItem = new EJS_CacheItem(
+                                "streamed-" + Date.now(), [], now, type, responseType, filename, url, null
+                            );
+                            streamedItem.streamed = true;
+                            // The entries are already on the filesystem, so files
+                            // stays empty -- emulator.js's extraction loop would
+                            // otherwise rewrite each one with the bytes held here.
+                            // The names still have to reach selectRomFile(), so
+                            // they travel separately.
+                            streamedItem.fileNames = entryNames;
+                            resolve(streamedItem);
+                            return;
+                        }
+
                         const ab = await blob.arrayBuffer();
                         data = new Uint8Array(ab);
                     } else {
