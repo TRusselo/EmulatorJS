@@ -1,6 +1,7 @@
 import { simpleHash } from "./utils.js";
 import { EJS_STORAGE } from "./storage.js";
 import { EJS_COMPRESSION } from "./compression.js";
+import { readZipEntries, streamingSupported } from "./zipstream.js";
 
 const CACHE_BLOB_CHUNK_SIZE = 50 * 1024 * 1024;
 
@@ -107,7 +108,7 @@ class EJS_Download {
      * @param {boolean} dontExtract - If true, the downloaded file will not be extracted, but will still be cached (default is false, overridden by forceExtract).
      * @returns {Promise<EJS_CacheItem>} - The downloaded file as an EJS_CacheItem.
      */
-    downloadFile(url, type, method = "GET", headers = {}, body = null, onProgress = null, onComplete = null, timeout = 30000, responseType = "arraybuffer", forceExtract = false, dontCache = false, dontExtract = false) {
+    downloadFile(url, type, method = "GET", headers = {}, body = null, onProgress = null, onComplete = null, timeout = 30000, responseType = "arraybuffer", forceExtract = false, dontCache = false, dontExtract = false, onFile = null) {
         let cacheActiveText = " (cache usage requested)"
         if (dontCache) {
             cacheActiveText = "";
@@ -218,6 +219,72 @@ class EJS_Download {
                         }
                         
                         const blob = new Blob(chunks);
+
+                        // V8 caps one ArrayBuffer at ~2 GiB, so larger archives are
+                        // read from the Blob an entry at a time. Smaller ones
+                        // keep the original path.
+                        const streamThreshold = (typeof window !== "undefined" && typeof window.EJS_streamZipThreshold === "number")
+                            ? window.EJS_streamZipThreshold
+                            : 1610612736;
+                        const isZip = (filename.toLowerCase().split(".").pop() === "zip");
+                        // dontExtract asks for the archive itself, forceExtract
+                        // overrides it. Checked before the size gate so the
+                        // ordinary rule still wins.
+                        const extractionWanted = (forceExtract === true || dontExtract === false);
+                        if (blob.size > streamThreshold && isZip && extractionWanted && typeof onFile === "function" && streamingSupported()) {
+                            console.log(`[EJS Download] Streaming ${filename} (${(blob.size / 1048576).toFixed(0)} MB) directly to the filesystem`);
+                            const entryNames = [];
+                            let reportedTotal = false;
+                            let lastWritten = 0, lastTotal = 0;
+                            try {
+                                await readZipEntries(blob, (entryName, entryBytes) => {
+                                    // Nothing else aliases these bytes, so MEMFS can take
+                                    // them without a copy.
+                                    onFile(entryName, entryBytes, true);
+                                    entryNames.push(entryName);
+                                }, (written, total) => {
+                                    // Not gated on free memory: no browser reports it.
+                                    // State the requirement so the failure below
+                                    // is interpretable.
+                                    if (!reportedTotal && total) {
+                                        reportedTotal = true;
+                                        console.log(`[EJS Download] ${filename} unpacks to ${(total / 1073741824).toFixed(2)} GB, all of which must be resident`);
+                                    }
+                                    lastWritten = written; lastTotal = total;
+                                    // The central directory gives a real total, so this is
+                                    // a true percentage.
+                                    if (onProgress) onProgress("decompressing", total ? written / total * 100 : 0, written, total);
+                                });
+                            } catch (e) {
+                                // download() reports every failure as "Network Error",
+                                // which is wrong here: the download finished and
+                                // the unpack failed.
+                                // How far it got separates "died immediately" from
+                                // "nearly made it".
+                                const text = String((e && e.message) || e);
+                                const mb = (n) => (n / 1048576).toFixed(0);
+                                const progress = lastTotal
+                                    ? ` after ${mb(lastWritten)} MB of ${mb(lastTotal)} MB unpacked (${Math.floor(lastWritten / lastTotal * 100)}%)`
+                                    : "";
+                                const err = new Error(`Decompression failed${progress}: ${text}`);
+                                err.ejsUserMessage = /allocation failed|out of memory|RangeError/i.test(text)
+                                    ? `Ran out of memory while unpacking ${filename}. Close other tabs or apps and try again.`
+                                    : `Could not unpack ${filename}: ${text}`;
+                                reject(err);
+                                return;
+                            }
+                            const streamedItem = new EJS_CacheItem(
+                                "streamed-" + Date.now(), [], now, type, responseType, filename, url, null
+                            );
+                            streamedItem.streamed = true;
+                            // Already on the filesystem, so files stays empty or
+                            // emulator.js would rewrite each one. The names still
+                            // have to reach selectRomFile().
+                            streamedItem.fileNames = entryNames;
+                            resolve(streamedItem);
+                            return;
+                        }
+
                         const ab = await blob.arrayBuffer();
                         data = new Uint8Array(ab);
                     } else {
