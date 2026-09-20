@@ -407,13 +407,13 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
             if (index === 24 && value === 1) {
                 const slot = this.EJS.settings["save-state-slot"] ? this.EJS.settings["save-state-slot"] : "1";
                 this.quickSave(slot).then((ok) => {
-                    if (ok) this.EJS.displayMessage(this.EJS.localization("SAVED STATE TO SLOT") + " " + slot);
+                    if (ok) this.EJS.displayMessage(this.EJS.localization("SAVED STATE TO SLOT") + " " + slot, null, "success");
                 });
             }
             if (index === 25 && value === 1) {
                 const slot = this.EJS.settings["save-state-slot"] ? this.EJS.settings["save-state-slot"] : "1";
                 this.quickLoad(slot).then((local) => {
-                    if (local) this.EJS.displayMessage(this.EJS.localization("LOADED STATE FROM SLOT") + " " + slot);
+                    if (local) this.EJS.displayMessage(this.EJS.localization("LOADED STATE FROM SLOT") + " " + slot, null, "success");
                 });
             }
             if (index === 26 && value === 1) {

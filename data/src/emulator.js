@@ -804,16 +804,22 @@ class EmulatorJS {
     saveInBrowserSupported() {
         return !!window.indexedDB && (typeof this.config.gameName === "string" || !this.config.gameUrl.startsWith("blob:"));
     }
-    displayMessage(message, time) {
+    displayMessage(message, time, severity) {
         if (!this.msgElem) {
             this.msgElem = this.createElement("div");
             this.msgElem.classList.add("ejs_message");
             this.msgElem.style.zIndex = "6";
             this.elements.parent.appendChild(this.msgElem);
         }
+        const severityClasses = ["ejs_message_error", "ejs_message_success"];
+        this.msgElem.classList.remove(...severityClasses);
+        if (severity === "error" || severity === "success") {
+            this.msgElem.classList.add("ejs_message_" + severity);
+        }
         clearTimeout(this.msgTimeout);
         this.msgTimeout = setTimeout(() => {
             this.msgElem.innerText = "";
+            this.msgElem.classList.remove(...severityClasses);
         }, (typeof time === "number" && time > 0) ? time : 3000)
         this.msgElem.innerText = message;
     }
@@ -1761,14 +1767,14 @@ class EmulatorJS {
             const slot = this.getSettingValue("save-state-slot") ? this.getSettingValue("save-state-slot") : "1";
             hideMenu();
             if (await this.gameManager.quickSave(slot)) {
-                this.displayMessage(this.localization("SAVED STATE TO SLOT") + " " + slot);
+                this.displayMessage(this.localization("SAVED STATE TO SLOT") + " " + slot, null, "success");
             }
         });
         const qLoad = addButton("Quick Load", false, async () => {
             const slot = this.getSettingValue("save-state-slot") ? this.getSettingValue("save-state-slot") : "1";
             hideMenu();
             if (await this.gameManager.quickLoad(slot)) {
-                this.displayMessage(this.localization("LOADED STATE FROM SLOT") + " " + slot);
+                this.displayMessage(this.localization("LOADED STATE FROM SLOT") + " " + slot, null, "success");
             }
         });
         this.elements.contextMenu = {
@@ -2225,7 +2231,7 @@ class EmulatorJS {
             if (stateUrl) URL.revokeObjectURL(stateUrl);
             if (this.getSettingValue("save-state-location") === "browser" && this.saveInBrowserSupported()) {
                 this.storage.states.put(this.getBaseFileName() + ".state", state);
-                this.displayMessage(this.localization("SAVED STATE TO BROWSER"));
+                this.displayMessage(this.localization("SAVED STATE TO BROWSER"), null, "success");
             } else {
                 const blob = new Blob([state]);
                 stateUrl = URL.createObjectURL(blob);
@@ -2241,7 +2247,7 @@ class EmulatorJS {
             if (this.getSettingValue("save-state-location") === "browser" && this.saveInBrowserSupported()) {
                 this.storage.states.get(this.getBaseFileName() + ".state").then(e => {
                     this.gameManager.loadState(e);
-                    this.displayMessage(this.localization("LOADED STATE FROM BROWSER"));
+                    this.displayMessage(this.localization("LOADED STATE FROM BROWSER"), null, "success");
                 })
             } else {
                 const file = await this.selectFile();

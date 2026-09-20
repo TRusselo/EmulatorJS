@@ -378,7 +378,7 @@ export class Netplay {
     defineNetplayFunctions() {
         this.updateList = { start: () => this._updateListStart(), stop: () => this._updateListStop() };
         if (!this.url) {
-            this.emu.displayMessage("Netplay URL not configured", 5000);
+            this.emu.displayMessage("Netplay URL not configured", 5000, "error");
             return;
         }
         const Module = (this.emu.gameManager && this.emu.gameManager.Module) ? this.emu.gameManager.Module : this.emu.Module;
@@ -992,7 +992,7 @@ export class Netplay {
             // Connection timeout fallback
             this.connectionTimeout = setTimeout(() => {
                 if (!this.webRtcReady && !this._gotVideoEver) {
-                    this.emu.displayMessage("Connection failed", 5000);
+                    this.emu.displayMessage("Connection failed", 5000, "error");
                     this.leaveRoom();
                 }
             }, 15000);
@@ -1739,7 +1739,7 @@ export class Netplay {
     /** Show error dialog when join fails */
     showJoinErrorDialog(roomId, roomName, maxPlayers, errorMessage, hadPassword) {
         if (!this.emu.createSubPopup) {
-            this.emu.displayMessage(this.emu.localization("Join error") + ": " + errorMessage, 5000);
+            this.emu.displayMessage(this.emu.localization("Join error") + ": " + errorMessage, 5000, "error");
             return;
         }
         const popups = this.emu.createSubPopup();
@@ -1786,15 +1786,15 @@ export class Netplay {
     /** Initialize Socket.IO connection and set up event handlers */
     startSocketIO(cb) {
         this._unlockMobileAudio();
-        if (typeof io === "undefined") { this.emu.displayMessage("Socket.IO unavailable", 5000); return; }
+        if (typeof io === "undefined") { this.emu.displayMessage("Socket.IO unavailable", 5000, "error"); return; }
         if (this.socket && this.socket.connected) { cb(); return; }
-        if (!this.url) { this.emu.displayMessage("Network error", 5000); return; }
+        if (!this.url) { this.emu.displayMessage("Network error", 5000, "error"); return; }
 
         this.previousPlayers = {};
         this.socket = io(this.url);
 
         this.socket.on("connect", () => { this.bindChatUI(); cb(); });
-        this.socket.on("connect_error", (e) => { this.emu.displayMessage("Connect error: " + e.message, 5000); });
+        this.socket.on("connect_error", (e) => { this.emu.displayMessage("Connect error: " + e.message, 5000, "error"); });
         this.socket.on("disconnect", () => { this.leaveRoom(); });
 
         // Handle player list updates
@@ -1953,7 +1953,7 @@ export class Netplay {
 
         this.startSocketIO(() => {
             this.socket.emit("open-room", { extra: this.extra, maxPlayers: mp, password: pw }, (e) => {
-                if (e) { this.emu.displayMessage("Room error: " + e, 5000); return; }
+                if (e) { this.emu.displayMessage("Room error: " + e, 5000, "error"); return; }
                 this.roomJoined(true, rn, pw, sid);
             });
         });
