@@ -78,7 +78,7 @@ class EmulatorJS {
      * @param {boolean} dontExtract If true, the downloaded file will not be extracted, but will still be cached (default is false, overridden by forceExtract).
      * @returns A promise that resolves with the downloaded file data.
      */
-    downloadFile(path, type, progress, notWithPath, opts, forceExtract = false, dontCache = false, dontExtract = false) {
+    downloadFile(path, type, progress, notWithPath, opts, forceExtract = false, dontCache = false, dontExtract = false, onFile = null) {
         if (this.debug) console.log("[EJS " + type + "] Downloading " + path);
         return new Promise(async (resolve) => {
             // Handle direct data objects (ArrayBuffer, Uint8Array, Blob)
@@ -138,11 +138,16 @@ class EmulatorJS {
                         responseType,
                         forceExtract,
                         dontCache,
-                        dontExtract
+                        dontExtract,
+                        onFile
                     );
 
                     if (!cacheItem) {
                         return { headers: {} };
+                    }
+
+                    if (cacheItem.streamed === true) {
+                        return { data: cacheItem, headers: {} };
                     }
 
                     if (cacheItem.files && cacheItem.files.length > 0) {
@@ -158,6 +163,11 @@ class EmulatorJS {
                     return -1;
                 } catch(error) {
                     console.error("Download error:", error);
+                    // Every failure collapses to -1 here, so a refusal that
+                    // knows why marks itself with ejsUserMessage.
+                    if (error && error.ejsUserMessage) {
+                        this.downloadUserMessage = error.ejsUserMessage;
+                    }
                     return -1;
                 }
             };
@@ -861,6 +871,30 @@ class EmulatorJS {
         return new Promise(async (resolve, reject) => {
             let returnData;
 
+            // canOwn lets MEMFS adopt the buffer rather than copy it,
+            // halving the peak. Only the streaming path may ask.
+            const writeFilesToFS = (fileName, fileData, canOwn = false) => {
+                if (fileName.includes("/")) {
+                    const paths = fileName.split("/");
+                    let cp = "";
+                    for (let i = 0; i < paths.length - 1; i++) {
+                        if (paths[i] === "") continue;
+                        cp += `/${paths[i]}`;
+                        if (!this.gameManager.FS.analyzePath(cp).exists) {
+                            this.gameManager.FS.mkdir(cp);
+                        }
+                    }
+                }
+                if (fileName.endsWith("/")) {
+                    if (!this.gameManager.FS.analyzePath(fileName).exists) {
+                        this.gameManager.FS.mkdir(fileName);
+                    }
+                    return null;
+                }
+                this.gameManager.FS.writeFile(`/${fileName}`, fileData, { canOwn });
+                return fileName;
+            };
+
             // check if url is a file object, and if so convert it to an EJS_CacheItem
             if (typeof url === "object" && url instanceof File) {
                 if (this.debug) console.log("[EJS " + type.name.toUpperCase() + "] Requested download for File object " + url.name);
@@ -939,11 +973,16 @@ class EmulatorJS {
                     { responseType: "arraybuffer", method: "GET" },
                     false,
                     type.dontCache,
-                    dontExtract
+                    dontExtract,
+                    writeFilesToFS
                 );
                 // check for error
                 if (data === -1) {
-                    this.startGameError(this.localization("Network Error"));
+                    // Cleared after use: otherwise one refused game would make
+                    // every later failure claim the same reason.
+                    const reason = this.downloadUserMessage;
+                    this.downloadUserMessage = null;
+                    this.startGameError(reason || this.localization("Network Error"));
                     return;
                 }
                 // check for content type
@@ -957,28 +996,6 @@ class EmulatorJS {
             }
 
             if (this.debug) console.log("[EJS " + type.name.toUpperCase() + "] Downloaded content:", returnData);
-
-            const writeFilesToFS = (fileName, fileData) => {
-                if (fileName.includes("/")) {
-                    const paths = fileName.split("/");
-                    let cp = "";
-                    for (let i = 0; i < paths.length - 1; i++) {
-                        if (paths[i] === "") continue;
-                        cp += `/${paths[i]}`;
-                        if (!this.gameManager.FS.analyzePath(cp).exists) {
-                            this.gameManager.FS.mkdir(cp);
-                        }
-                    }
-                }
-                if (fileName.endsWith("/")) {
-                    if (!this.gameManager.FS.analyzePath(fileName).exists) {
-                        this.gameManager.FS.mkdir(fileName);
-                    }
-                    return null;
-                }
-                this.gameManager.FS.writeFile(`/${fileName}`, fileData);
-                return fileName;
-            };
 
             // extract to the file system
             if (returnData && returnData.files) {
@@ -1102,13 +1119,13 @@ class EmulatorJS {
      * Extract file names from downloaded ROM data and start game
      */
     startGameFromDownload(romData) {
-        const fileNames = [];
-        for (const file of romData.files) {
-            if (file.filename.endsWith("/")) {
-                continue;
-            }
-            fileNames.push(file.filename);
-        }
+        // A streamed archive leaves files empty and its names on
+        // fileNames. Without this selectRomFile() leaves fileName
+        // undefined, which reaches the core as "/undefined".
+        const names = Array.isArray(romData.fileNames)
+            ? romData.fileNames
+            : romData.files.map((file) => file.filename);
+        const fileNames = names.filter((name) => !name.endsWith("/"));
         this.selectRomFile(fileNames, this.getCore());
         this.startGame();
     }
