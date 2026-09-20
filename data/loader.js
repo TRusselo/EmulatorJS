@@ -243,6 +243,7 @@ async function prepareLanguage() {
         ["ready", window.EJS_ready],
         ["start", window.EJS_onGameStart],
         ["loadState", window.EJS_onLoadState],
+        ["quickLoadState", window.EJS_onQuickLoadState],
         ["saveState", window.EJS_onSaveState],
         ["loadSave", window.EJS_onLoadSave],
         ["saveSave", window.EJS_onSaveSave],
