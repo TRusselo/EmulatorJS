@@ -547,20 +547,21 @@ class EJS_Frontend {
             hideMenu();
         });
 
-        const qSave = addButton("Quick Save", false, () => {
+        const qSave = addButton("Quick Save", false, async () => {
             const slot = this.ejs.getSettingValue("save-state-slot") ? this.ejs.getSettingValue("save-state-slot") : "1";
-            if (this.ejs.gameManager.quickSave(slot)) {
+            hideMenu();
+            // No failure branch: retryGetState() has already said why, with the
+            // engine's own reason rather than a generic one.
+            if (await this.ejs.gameManager.quickSave(slot)) {
                 this.displayMessage("SAVED STATE TO SLOT", undefined, " " + slot);
-            } else {
-                this.displayMessage("FAILED TO SAVE STATE");
             }
-            hideMenu();
         });
-        const qLoad = addButton("Quick Load", false, () => {
+        const qLoad = addButton("Quick Load", false, async () => {
             const slot = this.ejs.getSettingValue("save-state-slot") ? this.ejs.getSettingValue("save-state-slot") : "1";
-            this.ejs.gameManager.quickLoad(slot);
-            this.displayMessage("LOADED STATE FROM SLOT", undefined, " " + slot);
             hideMenu();
+            if (await this.ejs.gameManager.quickLoad(slot)) {
+                this.displayMessage("LOADED STATE FROM SLOT", undefined, " " + slot);
+            }
         });
         this.elements.contextMenu = {
             screenshot: screenshot,
@@ -974,13 +975,11 @@ class EJS_Frontend {
 
         let stateUrl;
         const saveState = addButton(this.ejs.config.buttonOpts.saveState, async () => {
-            let state;
-            try {
-                state = this.ejs.gameManager.getState();
-            } catch(e) {
-                this.displayMessage("FAILED TO SAVE STATE");
-                return;
-            }
+            // Captured when the engine will accept it rather than when the
+            // button was pressed, which is what the engine's own save menu
+            // does. Shared with the quick save so both wait out the same scenes.
+            const state = await this.ejs.gameManager.retryGetState();
+            if (state === null) return;
             const { screenshot, format } = await this.ejs.takeScreenshot(this.ejs.capture.photo.source, this.ejs.capture.photo.format, this.ejs.capture.photo.upscale);
             const called = this.ejs.callEvent("saveState", {
                 screenshot: screenshot,
