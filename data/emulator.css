@@ -1722,11 +1722,23 @@
     overflow: hidden;
     position: absolute;
     top: 0;
-    color: red;
+    color: #fff;
     font-size: 17px;
     padding: 10px;
     text-align: left;
     text-shadow: rgb(0, 0, 0) 1px 1px 1px;
+}
+
+.ejs_message:empty {
+    visibility: hidden;
+}
+
+.ejs_message_success {
+    color: #6fdc8c;
+}
+
+.ejs_message_error {
+    color: #ff6b6b;
 }
 
 .ejs_virtualGamepad_open {

@@ -378,7 +378,7 @@ export class Netplay {
     defineNetplayFunctions() {
         this.updateList = { start: () => this._updateListStart(), stop: () => this._updateListStop() };
         if (!this.url) {
-            this.emu.frontend.displayMessage("Netplay URL not configured", 5000);
+            this.emu.frontend.displayMessage("Netplay URL not configured", 5000, undefined, "error");
             return;
         }
         const Module = (this.emu.gameManager && this.emu.gameManager.Module) ? this.emu.gameManager.Module : this.emu.Module;
@@ -992,7 +992,7 @@ export class Netplay {
             // Connection timeout fallback
             this.connectionTimeout = setTimeout(() => {
                 if (!this.webRtcReady && !this._gotVideoEver) {
-                    this.emu.frontend.displayMessage("Connection failed", 5000);
+                    this.emu.frontend.displayMessage("Connection failed", 5000, undefined, "error");
                     this.leaveRoom();
                 }
             }, 15000);
@@ -1739,7 +1739,7 @@ export class Netplay {
     /** Show error dialog when join fails */
     showJoinErrorDialog(roomId, roomName, maxPlayers, errorMessage, hadPassword) {
         if (!this.emu.frontend.createSubPopup) {
-            this.emu.frontend.displayMessage(this.emu.frontend.localization("Join error") + ": " + errorMessage, 5000);
+            this.emu.frontend.displayMessage(this.emu.frontend.localization("Join error") + ": " + errorMessage, 5000, undefined, "error");
             return;
         }
         const popups = this.emu.frontend.createSubPopup();
