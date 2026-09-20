@@ -112,7 +112,9 @@ async function loadLanguage(config) {
 
     try {
         const specificJson = await fetchJson(paths.path);
-        
+
+        if (!specificJson && defaultLangs.includes(config.language.split(/[-_]/)[0])) return config;
+
         if (paths.fallback) {
             const fallbackJson = await fetchJson(paths.fallback);
             langData = mergeLanguages(fallbackJson, specificJson || {});
