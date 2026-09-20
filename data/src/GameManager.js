@@ -210,18 +210,210 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
     getState() {
         return this.Module.EmulatorJSGetState();
     }
-    loadState(state) {
+    // Shared by loadState() and quickLoad(). An engine decides for itself
+    // whether a load is possible right now, and several stay shut for seconds:
+    // Blade Runner while a video plays, Sanitarium mid-speech, Kyrandia outside
+    // its own runLoop(). The core cannot wait for that -- it holds the main
+    // thread while it does, so nothing is drawn -- so the waiting lives here,
+    // where the game keeps running between attempts.
+    //
+    // Every retry here exists for one protocol: a core that declines a save or a
+    // load writes its reason to /savestate_error.txt, and the frontend waits the
+    // refusal out rather than failing. EmulatorJS drives 187 cores and only
+    // ScummVM implements it, so for the rest that wait is spent on a file that
+    // will never appear. They take the unpatched path untouched.
+    //
+    // Named rather than probed: a core that simply had nothing to refuse looks
+    // identical to one that cannot refuse, so absence proves nothing. A
+    // capability flag in core.json would be the cleaner signal if the protocol
+    // is ever adopted more widely.
+    savestateRetrySupported() {
+        try {
+            return this.EJS.getCore() === "scummvm";
+        } catch(e) { return false; }
+    }
+    // The core leaves its reason in the shared filesystem, because the libretro
+    // OSD reaches neither the log nor the screen here. First line is
+    // "permanent" or "temporary"; the rest is what to show.
+    savestateRefusal() {
+        try {
+            const text = this.FS.readFile("/savestate_error.txt", { encoding: "utf8" });
+            const nl = text.indexOf("\n");
+            if (nl < 0) return null;
+            return { permanent: text.slice(0, nl).trim() === "permanent", message: text.slice(nl + 1).trim() };
+        } catch(e) { return null; }
+    }
+    clearSavestateRefusal() {
+        try {
+            this.FS.unlink("/savestate_error.txt");
+        } catch(e) {}
+    }
+    // An engine can refuse a save while a scene is still playing: Riven's
+    // canSaveGameStateCurrently() is false for as long as it has queued
+    // scripts, and one stays queued for the length of the animation it runs.
+    // The core cannot usefully wait for that itself -- it owns the main thread
+    // while it blocks, so nothing is drawn. Waiting here costs nothing: the
+    // game keeps running between attempts and the scene plays out on screen.
+    //
+    // Returns the state, or null having already said why.
+    async retryGetState() {
+        if (!this.savestateRetrySupported()) {
+            try {
+                return this.getState();
+            } catch(e) {
+                this.EJS.frontend.displayMessage("FAILED TO SAVE STATE", 6000, "error");
+                return null;
+            }
+        }
+        const waitMs = (typeof window !== "undefined" && typeof window.EJS_saveStateWaitMs === "number")
+            ? window.EJS_saveStateWaitMs : 10000;
+        const retryUntil = Date.now() + waitMs;
+        let lastSaid = null;
+        let attempts = 0;
+        if (this.EJS.debug) console.log(`[save] budget: waitMs=${waitMs}`);
+        for (;;) {
+            this.clearSavestateRefusal();
+            attempts++;
+            let failure;
+            try {
+                const state = this.getState();
+                if (this.EJS.debug) console.log(`[save] accepted on attempt ${attempts}`);
+                return state;
+            } catch(e) { failure = e; }
+            const reason = this.savestateRefusal();
+            // Only a core that says why it refused can be waited out. A core
+            // that throws without one has failed outright, so retrying spends
+            // the whole budget to reach the same answer -- and says "waiting
+            // for the scene to end" to a console that has no scenes. Fail as
+            // the unpatched build does, and show what was thrown, which is
+            // otherwise lost.
+            if (!reason) {
+                if (this.EJS.debug) console.log(`[save] giving up on attempt ${attempts}, no reason reported:`, failure);
+                this.EJS.frontend.displayMessage("FAILED TO SAVE STATE", 6000, "error");
+                return null;
+            }
+            // A refusal the engine will never lift -- an SCI game with save
+            // states switched off -- must not be retried to arrive at the same
+            // answer.
+            if (reason.permanent) {
+                this.EJS.frontend.displayMessage(reason.message, 6000, "error");
+                return null;
+            }
+            if (Date.now() >= retryUntil) {
+                this.EJS.frontend.displayMessage(reason.message, 6000, "error");
+                return null;
+            }
+            if (this.EJS.debug) console.log(`[save] attempt ${attempts} refused (temporary), ${Math.max(0, retryUntil - Date.now())}ms of ${waitMs} left`);
+            // As above: prefer the engine's reason over a generic one. Shown
+            // only when it changes: the host may stack notices rather than
+            // replace them, and one refusal repeated is one thing to say.
+            const waiting = reason.message || "WAITING FOR THE SCENE TO END";
+            if (waiting !== lastSaid) {
+                lastSaid = waiting;
+                this.EJS.frontend.displayMessage(waiting);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+    }
+    async retryLoadState(name, options) {
+        const opts = options || {};
+        const refusal = () => this.savestateRefusal();
+        const clearRefusal = () => this.clearSavestateRefusal();
+
+        // An attempt is not free: the wrap blocks the main thread for a second
+        // or more while the core switches threads to answer, so retrying is
+        // felt as a stuttering tab rather than a quiet wait.
+        //
+        // A load fired automatically at launch is therefore capped by count,
+        // not by a clock. It is racing the game's own opening, which can run
+        // for minutes -- Orion Burger plays a cutscene the moment the title
+        // screen appears -- and no budget that outlasts that is worth what it
+        // costs to sit through. Give up early and say what does work instead.
+        const maxAttempts = typeof opts.maxAttempts === "number" ? opts.maxAttempts : 0;
+        const waitMs = (typeof window !== "undefined" && typeof window.EJS_loadStateWaitMs === "number")
+            ? window.EJS_loadStateWaitMs : 10000;
+        const retryUntil = Date.now() + waitMs;
+        let attempts = 0;
+        let lastSaid = null;
+        // Logged per attempt so a run that looks wrong can be read rather than
+        // guessed at.
+        if (this.EJS.debug) console.log(`[load] budget: maxAttempts=${maxAttempts || "none"}, waitMs=${waitMs}`);
+        for (;;) {
+            // Cleared before every attempt, not just the first: the file is the
+            // only signal there is, so an attempt that leaves it absent is one
+            // the core accepted -- or never saw, because the game has since
+            // exited. Reading the previous attempt's refusal instead means the
+            // loop cannot end, and it keeps calling into an unloaded core.
+            clearRefusal();
+            // The core writes a refusal only if it sees the request at all, so
+            // an absent refusal cannot be read as success without knowing the
+            // payload survived. An earlier load's deferred cleanup used to
+            // remove it mid-retry, and the core then loaded zero bytes and
+            // wrote nothing, which read back as "accepted".
+            let stateSize = 0;
+            try {
+                stateSize = this.FS.stat("/" + name).size;
+            } catch(e) {}
+            if (!stateSize) {
+                this.EJS.frontend.displayMessage("FAILED TO LOAD STATE", 6000, "error");
+                return false;
+            }
+            this.functions.loadState(name, 0);
+            attempts++;
+            // content_load_state() queues a task rather than running inline, so
+            // the reason is not there the instant this returns.
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            const reason = refusal();
+            if (!reason) {
+                if (this.EJS.debug) console.log(`[load] accepted on attempt ${attempts}`);
+                return true;
+            }
+            const spent = maxAttempts ? attempts >= maxAttempts : Date.now() >= retryUntil;
+            if (this.EJS.debug) console.log(`[load] attempt ${attempts} refused (${reason.permanent ? "permanent" : "temporary"}), maxAttempts=${maxAttempts || "none"}, ${Math.max(0, retryUntil - Date.now())}ms of ${waitMs} left, spent=${spent}`);
+            if (reason.permanent || spent) {
+                const message = (spent && !reason.permanent && opts.giveUpMessage)
+                    ? opts.giveUpMessage : reason.message;
+                this.EJS.frontend.displayMessage(message, 8000, "error");
+                return false;
+            }
+            // The engine's wording when it gave one: "waiting for the scene to
+            // end" is wrong for a refusal that is not about a scene at all.
+            // Shown only when it changes, as in retryGetState().
+            const waiting = reason.message || "WAITING FOR THE SCENE TO END";
+            if (waiting !== lastSaid) {
+                lastSaid = waiting;
+                this.EJS.frontend.displayMessage(waiting, 1500);
+            }
+        }
+    }
+    async loadState(state, options) {
+        // Loads share one path, so an earlier call's cleanup timer could remove
+        // the file a later call is still retrying against. Only the newest load
+        // is allowed to clear it.
+        const generation = (this.loadStateGeneration = (this.loadStateGeneration || 0) + 1);
         try {
             this.FS.unlink("game.state");
         } catch(e) {}
         this.FS.writeFile("/game.state", state);
         this.clearEJSResetTimer();
-        this.functions.loadState("game.state", 0);
+        let loaded;
+        if (this.savestateRetrySupported()) {
+            loaded = await this.retryLoadState("game.state", options);
+        } else {
+            // Exactly the unpatched call: no wait, no refusal check, and no
+            // claim beyond "nothing reported an error", which is all the
+            // unpatched build ever offered.
+            this.functions.loadState("game.state", 0);
+            loaded = true;
+        }
         setTimeout(() => {
+            if (this.loadStateGeneration !== generation) return;
             try {
                 this.FS.unlink("game.state");
             } catch(e) {}
         }, 5000)
+        // Returned, so a caller does not announce a load the engine refused.
+        return loaded;
     }
     screenshot() {
         try {
@@ -238,27 +430,47 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
             }
         })
     }
-    quickSave(slot) {
+    async quickSave(slot) {
         if (!slot) slot = 1;
-        let name = slot + "-quick.state";
+        const name = slot + "-quick.state";
         try {
             this.FS.unlink(name);
         } catch(e) {}
+        const data = await this.retryGetState();
+        // retryGetState() has already said why.
+        if (data === null) return false;
+        this.FS.writeFile("/" + name, data);
+        // Offer it to the host as an ordinary save state, so a quick save is
+        // kept wherever the Save State button's are and survives the tab. With
+        // no listener it stays in the in-memory filesystem, as it always did.
+        let screenshot, format;
         try {
-            let data = this.getState();
-            this.FS.writeFile("/" + name, data);
-        } catch(e) {
-            return false;
+            ({ screenshot, format } = await this.EJS.takeScreenshot(this.EJS.capture.photo.source,
+                this.EJS.capture.photo.format, this.EJS.capture.photo.upscale));
+        } catch(e) {}
+        const called = this.EJS.callEvent("saveState", { screenshot: screenshot, format: format, state: data });
+        // The Save State button returns early on a handled event rather than
+        // speaking over the host. Report that here so this route can match it.
+        return called > 0 ? "handled" : true;
+    }
+    // Returns true when the local copy was used, so the caller knows whether to
+    // announce the slot: a host that takes this over reports for itself, and
+    // may have nothing to load.
+    async quickLoad(slot) {
+        if (!slot) slot = 1;
+        this.clearEJSResetTimer();
+        // Ask the host for its most recent state first, so a quick load reaches
+        // the ones a quick save sent it -- including from another machine.
+        // Nothing listening means there is only the local copy.
+        if (this.EJS.callEvent("quickLoadState", { slot: slot }) > 0) return false;
+        // Same refusal handling as loadState(), and gated the same way: a core
+        // that cannot refuse is called once, as the unpatched build does.
+        if (this.savestateRetrySupported()) {
+            await this.retryLoadState(slot + "-quick.state");
+        } else {
+            this.functions.loadState(slot + "-quick.state", 0);
         }
         return true;
-    }
-    quickLoad(slot) {
-        if (!slot) slot = 1;
-        (async () => {
-            let name = slot + "-quick.state";
-            this.clearEJSResetTimer();
-            this.functions.loadState(name, 0);
-        })();
     }
     simulateInput(player, index, value) {
         if (this.EJS.isNetplay) {
@@ -268,16 +480,15 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
         if ([24, 25, 26, 27, 28, 29].includes(index)) {
             if (index === 24 && value === 1) {
                 const slot = this.EJS.frontend.settings["save-state-slot"] ? this.EJS.frontend.settings["save-state-slot"] : "1";
-                if (this.quickSave(slot)) {
-                    this.EJS.frontend.displayMessage("SAVED STATE TO SLOT", undefined, " " + slot);
-                } else {
-                    this.EJS.frontend.displayMessage("FAILED TO SAVE STATE");
-                }
+                this.quickSave(slot).then((ok) => {
+                    if (ok === true) this.EJS.frontend.displayMessage("SAVED STATE TO SLOT", undefined, " " + slot);
+                });
             }
             if (index === 25 && value === 1) {
                 const slot = this.EJS.frontend.settings["save-state-slot"] ? this.EJS.frontend.settings["save-state-slot"] : "1";
-                this.quickLoad(slot);
-                this.EJS.frontend.displayMessage("LOADED STATE FROM SLOT", undefined, " " + slot);
+                this.quickLoad(slot).then((local) => {
+                    if (local) this.EJS.frontend.displayMessage("LOADED STATE FROM SLOT", undefined, " " + slot);
+                });
             }
             if (index === 26 && value === 1) {
                 let newSlot;

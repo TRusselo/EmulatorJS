@@ -552,7 +552,7 @@ class EJS_Frontend {
             hideMenu();
             // No failure branch: retryGetState() has already said why, with the
             // engine's own reason rather than a generic one.
-            if (await this.ejs.gameManager.quickSave(slot)) {
+            if (await this.ejs.gameManager.quickSave(slot) === true) {
                 this.displayMessage("SAVED STATE TO SLOT", undefined, " " + slot);
             }
         });
