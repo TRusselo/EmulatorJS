@@ -1757,20 +1757,19 @@ class EmulatorJS {
             hideMenu();
         });
 
-        const qSave = addButton("Quick Save", false, () => {
+        const qSave = addButton("Quick Save", false, async () => {
             const slot = this.getSettingValue("save-state-slot") ? this.getSettingValue("save-state-slot") : "1";
-            if (this.gameManager.quickSave(slot)) {
+            hideMenu();
+            if (await this.gameManager.quickSave(slot)) {
                 this.displayMessage(this.localization("SAVED STATE TO SLOT") + " " + slot);
-            } else {
-                this.displayMessage(this.localization("FAILED TO SAVE STATE"));
             }
-            hideMenu();
         });
-        const qLoad = addButton("Quick Load", false, () => {
+        const qLoad = addButton("Quick Load", false, async () => {
             const slot = this.getSettingValue("save-state-slot") ? this.getSettingValue("save-state-slot") : "1";
-            this.gameManager.quickLoad(slot);
-            this.displayMessage(this.localization("LOADED STATE FROM SLOT") + " " + slot);
             hideMenu();
+            if (await this.gameManager.quickLoad(slot)) {
+                this.displayMessage(this.localization("LOADED STATE FROM SLOT") + " " + slot);
+            }
         });
         this.elements.contextMenu = {
             screenshot: screenshot,
@@ -2212,13 +2211,10 @@ class EmulatorJS {
 
         let stateUrl;
         const saveState = addButton(this.config.buttonOpts.saveState, async () => {
-            let state;
-            try {
-                state = this.gameManager.getState();
-            } catch(e) {
-                this.displayMessage(this.localization("FAILED TO SAVE STATE"));
-                return;
-            }
+            // Captured when the engine will accept it, not when the
+            // button was pressed. Shared with the quick save.
+            const state = await this.gameManager.retryGetState();
+            if (state === null) return;
             const { screenshot, format } = await this.takeScreenshot(this.capture.photo.source, this.capture.photo.format, this.capture.photo.upscale);
             const called = this.callEvent("saveState", {
                 screenshot: screenshot,
