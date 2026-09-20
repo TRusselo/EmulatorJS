@@ -210,18 +210,142 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
     getState() {
         return this.Module.EmulatorJSGetState();
     }
-    loadState(state) {
+    // The core leaves its reason here: first line "permanent" or "temporary",
+    // the rest is what to show.
+    savestateRefusal() {
+        try {
+            const text = this.FS.readFile("/savestate_error.txt", { encoding: "utf8" });
+            const nl = text.indexOf("\n");
+            if (nl < 0) return null;
+            return { permanent: text.slice(0, nl).trim() === "permanent", message: text.slice(nl + 1).trim() };
+        } catch(e) { return null; }
+    }
+    clearSavestateRefusal() {
+        try {
+            this.FS.unlink("/savestate_error.txt");
+        } catch(e) {}
+    }
+    // Waiting lives here, not in the core: the core owns the main thread while
+    // it blocks, so nothing would be drawn. Returns null having already said
+    // why.
+    async retryGetState() {
+        const waitMs = (typeof window !== "undefined" && typeof window.EJS_saveStateWaitMs === "number")
+            ? window.EJS_saveStateWaitMs : 10000;
+        const retryUntil = Date.now() + waitMs;
+        let lastSaid = null;
+        let attempts = 0;
+        if (this.EJS.debug) console.log(`[save] budget: waitMs=${waitMs}`);
+        for (;;) {
+            this.clearSavestateRefusal();
+            attempts++;
+            try {
+                const state = this.getState();
+                if (this.EJS.debug) console.log(`[save] accepted on attempt ${attempts}`);
+                return state;
+            } catch(e) {}
+            const reason = this.savestateRefusal();
+            // A refusal the engine will never lift -- an SCI game with save
+            // states switched off -- must not be retried to arrive at the same
+            // answer.
+            if (reason && reason.permanent) {
+                this.EJS.displayMessage(reason.message, 6000, "error");
+                return null;
+            }
+            if (Date.now() >= retryUntil) {
+                this.EJS.displayMessage(reason ? reason.message : this.EJS.localization("FAILED TO SAVE STATE"), 6000, "error");
+                return null;
+            }
+            // As above: prefer the engine's reason over a generic one. Shown
+            // only when it changes: the host may stack notices rather than
+            // replace them, and one refusal repeated is one thing to say.
+            if (this.EJS.debug) console.log(`[save] attempt ${attempts} refused (${reason && reason.permanent ? "permanent" : "temporary"}), ${Math.max(0, retryUntil - Date.now())}ms of ${waitMs} left`);
+            const waiting = (reason && reason.message) || this.EJS.localization("WAITING FOR THE SCENE TO END");
+            if (waiting !== lastSaid) {
+                lastSaid = waiting;
+                this.EJS.displayMessage(waiting);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+    }
+    async retryLoadState(name, options) {
+        const opts = options || {};
+        const refusal = () => this.savestateRefusal();
+        const clearRefusal = () => this.clearSavestateRefusal();
+
+        // A launch load is capped by count, not by the clock: it races the
+        // game's own opening, which can outlast any budget worth sitting
+        // through. Each attempt stutters the tab, so they are not free.
+        const maxAttempts = typeof opts.maxAttempts === "number" ? opts.maxAttempts : 0;
+        const waitMs = (typeof window !== "undefined" && typeof window.EJS_loadStateWaitMs === "number")
+            ? window.EJS_loadStateWaitMs : 10000;
+        const retryUntil = Date.now() + waitMs;
+        let attempts = 0;
+        let lastSaid = null;
+        // The budget has never been observed enforced: a launch load ran 35
+        // attempts against a 5-attempt cap and a 10s clock. Log what the call
+        // actually resolved to, so the next log says which of the two is wrong.
+        if (this.EJS.debug) console.log(`[load] budget: maxAttempts=${maxAttempts || "none"}, waitMs=${waitMs}`);
+        for (;;) {
+            // Cleared before every attempt: the file is the only signal, so a
+            // stale one from the previous attempt would stop the loop ending.
+            clearRefusal();
+            // An absent refusal only means success if the payload survived: a
+            // zero-byte load writes nothing and reads back as accepted.
+            let stateSize = 0;
+            try {
+                stateSize = this.FS.stat("/" + name).size;
+            } catch(e) {}
+            if (!stateSize) {
+                this.EJS.displayMessage(this.EJS.localization("FAILED TO LOAD STATE"), 6000, "error");
+                return false;
+            }
+            this.functions.loadState(name, 0);
+            attempts++;
+            // content_load_state() queues a task rather than running inline, so
+            // the reason is not there the instant this returns.
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            const reason = refusal();
+            if (!reason) {
+                if (this.EJS.debug) console.log(`[load] accepted on attempt ${attempts}`);
+                return true;
+            }
+            const spent = maxAttempts ? attempts >= maxAttempts : Date.now() >= retryUntil;
+            if (this.EJS.debug) console.log(`[load] attempt ${attempts} refused (${reason.permanent ? "permanent" : "temporary"}), maxAttempts=${maxAttempts || "none"}, ${Math.max(0, retryUntil - Date.now())}ms of ${waitMs} left, spent=${spent}`);
+            if (reason.permanent || spent) {
+                const message = (spent && !reason.permanent && opts.giveUpMessage)
+                    ? opts.giveUpMessage : reason.message;
+                this.EJS.displayMessage(message, 8000, "error");
+                return false;
+            }
+            // The engine's wording when it gave one: "waiting for the scene to
+            // end" is wrong for a refusal that is not about a scene at all.
+            // Shown only when it changes, as above.
+            const waiting = reason.message || this.EJS.localization("WAITING FOR THE SCENE TO END");
+            if (waiting !== lastSaid) {
+                lastSaid = waiting;
+                this.EJS.displayMessage(waiting, 1500);
+            }
+        }
+    }
+    async loadState(state, options) {
+        // Loads share one path, so an earlier call's cleanup timer could remove
+        // the file a later call is still retrying against. Only the newest load
+        // is allowed to clear it.
+        const generation = (this.loadStateGeneration = (this.loadStateGeneration || 0) + 1);
         try {
             this.FS.unlink("game.state");
         } catch(e) {}
         this.FS.writeFile("/game.state", state);
         this.clearEJSResetTimer();
-        this.functions.loadState("game.state", 0);
+        // Returned, so a caller does not announce a load the engine refused.
+        const loaded = await this.retryLoadState("game.state", options);
         setTimeout(() => {
+            if (this.loadStateGeneration !== generation) return;
             try {
                 this.FS.unlink("game.state");
             } catch(e) {}
         }, 5000)
+        return loaded;
     }
     screenshot() {
         try {
@@ -238,27 +362,41 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
             }
         })
     }
-    quickSave(slot) {
+    async quickSave(slot) {
         if (!slot) slot = 1;
-        let name = slot + "-quick.state";
+        const name = slot + "-quick.state";
         try {
             this.FS.unlink(name);
         } catch(e) {}
+        const data = await this.retryGetState();
+        // retryGetState() has already said why.
+        if (data === null) return false;
+        this.FS.writeFile("/" + name, data);
+        // Offer it to the host as an ordinary save state, so a quick save is
+        // kept wherever the Save State button's are and survives the tab. With
+        // no listener it stays in the in-memory filesystem, as it always did.
+        let screenshot, format;
         try {
-            let data = this.getState();
-            this.FS.writeFile("/" + name, data);
-        } catch(e) {
-            return false;
-        }
+            ({ screenshot, format } = await this.EJS.takeScreenshot(this.EJS.capture.photo.source,
+                this.EJS.capture.photo.format, this.EJS.capture.photo.upscale));
+        } catch(e) {}
+        this.EJS.callEvent("saveState", { screenshot: screenshot, format: format, state: data });
         return true;
     }
-    quickLoad(slot) {
+    // Returns true when the local copy was used, so the caller knows whether to
+    // announce the slot: a host that takes this over reports for itself, and
+    // may have nothing to load.
+    async quickLoad(slot) {
         if (!slot) slot = 1;
-        (async () => {
-            let name = slot + "-quick.state";
-            this.clearEJSResetTimer();
-            this.functions.loadState(name, 0);
-        })();
+        this.clearEJSResetTimer();
+        // Ask the host for its most recent state first, so a quick load reaches
+        // the ones a quick save sent it -- including from another machine.
+        // Nothing listening means there is only the local copy.
+        if (this.EJS.callEvent("quickLoadState", { slot: slot }) > 0) return false;
+        // Same refusal handling as loadState(): a core may decline for as long
+        // as it likes, and calling the wrap once just loses the load.
+        await this.retryLoadState(slot + "-quick.state");
+        return true;
     }
     simulateInput(player, index, value) {
         if (this.EJS.isNetplay) {
@@ -268,16 +406,15 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
         if ([24, 25, 26, 27, 28, 29].includes(index)) {
             if (index === 24 && value === 1) {
                 const slot = this.EJS.settings["save-state-slot"] ? this.EJS.settings["save-state-slot"] : "1";
-                if (this.quickSave(slot)) {
-                    this.EJS.displayMessage(this.EJS.localization("SAVED STATE TO SLOT") + " " + slot);
-                } else {
-                    this.EJS.displayMessage(this.EJS.localization("FAILED TO SAVE STATE"));
-                }
+                this.quickSave(slot).then((ok) => {
+                    if (ok) this.EJS.displayMessage(this.EJS.localization("SAVED STATE TO SLOT") + " " + slot);
+                });
             }
             if (index === 25 && value === 1) {
                 const slot = this.EJS.settings["save-state-slot"] ? this.EJS.settings["save-state-slot"] : "1";
-                this.quickLoad(slot);
-                this.EJS.displayMessage(this.EJS.localization("LOADED STATE FROM SLOT") + " " + slot);
+                this.quickLoad(slot).then((local) => {
+                    if (local) this.EJS.displayMessage(this.EJS.localization("LOADED STATE FROM SLOT") + " " + slot);
+                });
             }
             if (index === 26 && value === 1) {
                 let newSlot;
